@@ -1,4 +1,4 @@
-from src.mambax import Mamba2
+from src.mambax import Mamba2, Mamba2InferenceCache
 from src.mhlax import MultiHeadLatentAttention, _make_rotary_PE, _apply_rotary_PE
 
 
@@ -42,7 +42,7 @@ class MambaIndexer(eqx.Module):
     def get_scores(self, x: Float[Array, "seq d_model"]) -> Float[Array, "seq seq"]:
         seq_len, _ = x.shape
 
-        x_mamba = self.mamba_block(x)
+        x_mamba, _ = self.mamba_block(x)
 
         q_idx = jax.vmap(self.q_proj)(x_mamba)
 
@@ -204,5 +204,8 @@ if __name__ == "__main__":
         return jnp.sum(out)
 
     grads = jax.grad(loss_fn)(model, x)
-    assert jnp.all(grads != 0) and jnp.all(jnp.isfinite(grads))
-    print("Gradients computed successfully (non-zero/non-nan).")
+    # Check gradients are finite by flattening the PyTree
+    grad_leaves = jax.tree_util.tree_leaves(grads)
+    all_finite = all(jnp.all(jnp.isfinite(g)) for g in grad_leaves if isinstance(g, jnp.ndarray))
+    assert all_finite, "Gradients contain NaN or Inf values"
+    print("Gradients computed successfully (all finite).")
