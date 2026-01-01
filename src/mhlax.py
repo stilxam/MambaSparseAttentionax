@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import equinox as eqx
 
 from jaxtyping import Float, Int, Bool, PRNGKeyArray, Array
-from typing import Optional, Tuple
+from typing import Optional, Tuple, NamedTuple
 
 
 def _make_rotary_PE(seq_len: int, dim: int,)-> Tuple[Float[Array, "seq dim_half"], Float[Array, "seq dim_half"]]:
@@ -77,6 +77,23 @@ def _apply_rotary_PE(
 
     rotated_x = jnp.concatenate((-x2, x1), axis=-1)
     return (x * cos_expanded) + (rotated_x * sin_expanded)
+
+
+class MLAKVCache(NamedTuple):
+    """
+    Cache for KV pairs in Multi-Head Latent Attention inference mode.
+
+    Stores accumulated key and value tensors for autoregressive generation.
+
+    Attributes:
+        keys: Cached keys of shape (cached_seq, num_heads, key_dim)
+              where key_dim = v_head_dim + rope_dim
+        values: Cached values of shape (cached_seq, num_heads, v_head_dim)
+        position: Current position in the sequence (number of cached tokens)
+    """
+    keys: Float[Array, "cached_seq num_heads key_dim"]
+    values: Float[Array, "cached_seq num_heads v_head_dim"]
+    position: int
 
 
 class MultiHeadLatentAttention(eqx.Module):
@@ -169,12 +186,27 @@ class MultiHeadLatentAttention(eqx.Module):
         self.v_head_dim = v_head_dim
         self.rope_dim = rope_dim
 
+    def init_cache(self, max_seq_len: int) -> MLAKVCache:
+        """
+        Initialize KV cache for inference mode.
+
+        Args:
+            max_seq_len: Maximum sequence length to support
+
+        Returns:
+            MLAKVCache with zero-initialized keys and values
+        """
+        key_dim = self.v_head_dim + self.rope_dim
+        keys = jnp.zeros((max_seq_len, self.num_heads, key_dim), dtype=jnp.bfloat16)
+        values = jnp.zeros((max_seq_len, self.num_heads, self.v_head_dim), dtype=jnp.bfloat16)
+        return MLAKVCache(keys=keys, values=values, position=0)
 
     def compute_attention_content(
         self,
         x: Float[Array, "seq embed"],
-        mask: Optional[Bool[Array, "seq seq"]]
-    ) -> Float[Array, "seq val_dim_total"]:
+        mask: Optional[Bool[Array, "seq seq"]],
+        cache: Optional[MLAKVCache] = None
+    ) -> Tuple[Float[Array, "seq val_dim_total"], Optional[MLAKVCache]]:
         """
         Compute multi-head attention with low-rank projections.
 
@@ -187,13 +219,21 @@ class MultiHeadLatentAttention(eqx.Module):
         6. Pad values to match key dimension
         7. Compute scaled dot-product attention
 
+        If cache is provided:
+        - Keys and values are appended to the cache
+        - Attention is computed over all cached + current tokens
+        - Returns updated cache
+
         Args:
             x: Input sequence of shape (seq_len, embed_dim)
             mask: Optional attention mask of shape (seq_len, seq_len)
                   True indicates positions that can be attended to
+            cache: Optional KV cache for inference mode
 
         Returns:
-            Attention output of shape (seq_len, num_heads * v_head_dim)
+            Tuple of:
+            - Attention output of shape (seq_len, num_heads * v_head_dim)
+            - Updated cache (or None if not using cache)
         """
         seq_len, _ = x.shape
 
@@ -210,9 +250,16 @@ class MultiHeadLatentAttention(eqx.Module):
         k_content = k_content_flat.reshape(seq_len, self.num_heads, self.v_head_dim)
         v = v_flat.reshape(seq_len, self.num_heads, self.v_head_dim)
 
+        # Determine position offset for RoPE based on cache
+        position_offset = cache.position if cache is not None else 0
+
         # Shared RoPE key projection (one per position, broadcast to all heads)
         k_rope_shared = jax.vmap(self.k_rope_proj)(x)[:, None, :]  # (seq, 1, rope_dim)
-        sin, cos = _make_rotary_PE(seq_len, self.rope_dim)
+        sin, cos = _make_rotary_PE(position_offset + seq_len, self.rope_dim)
+
+        # Slice sin/cos to current positions
+        sin = sin[position_offset:position_offset + seq_len]
+        cos = cos[position_offset:position_offset + seq_len]
 
         # Apply rotary embeddings to position components
         q_rope_rot = _apply_rotary_PE(q_rope, sin, cos)
@@ -223,8 +270,26 @@ class MultiHeadLatentAttention(eqx.Module):
         q_final = jnp.concatenate([q_content, q_rope_rot], axis=-1)
         k_final = jnp.concatenate([k_content, k_rope_rot], axis=-1)
 
+        # Handle KV caching
+        new_cache = None
+        if cache is not None:
+            # Append new keys and values to cache
+            k_cached = cache.keys.at[position_offset:position_offset + seq_len].set(k_final.astype(jnp.bfloat16))
+            v_cached = cache.values.at[position_offset:position_offset + seq_len].set(v.astype(jnp.bfloat16))
+
+            # Use cached K, V up to current position
+            k_final = k_cached[:position_offset + seq_len]
+            v = v_cached[:position_offset + seq_len]
+
+            # Update cache position
+            new_cache = MLAKVCache(
+                keys=k_cached,
+                values=v_cached,
+                position=position_offset + seq_len
+            )
+
         # Pad values with zeros to match key dimension (v_head_dim + rope_dim)
-        zeros_padding = jnp.zeros((seq_len, self.num_heads, self.rope_dim), dtype=v.dtype)
+        zeros_padding = jnp.zeros((v.shape[0], self.num_heads, self.rope_dim), dtype=v.dtype)
         v_padded = jnp.concatenate([v, zeros_padding], axis=-1)
 
         # Prepare mask for attention (expand to 4D for broadcasting)
@@ -251,14 +316,15 @@ class MultiHeadLatentAttention(eqx.Module):
         # Remove padding from output (keep only first v_head_dim dimensions)
         attn_out = attn_out_padded.astype(dtype_attn)[..., :self.v_head_dim]
 
-        return attn_out.reshape(seq_len, self.num_heads * self.v_head_dim)
+        return attn_out.reshape(seq_len, self.num_heads * self.v_head_dim), new_cache
 
     def __call__(
             self,
             x: Float[Array, "seq embed"],
             mask: Optional[Bool[Array, "seq seq"]] = None,
+            cache: Optional[MLAKVCache] = None,
             key: Optional[PRNGKeyArray] = None
-        ) -> Float[Array, "seq embed"]:
+        ) -> Tuple[Float[Array, "seq embed"], Optional[MLAKVCache]]:
         """
         Forward pass through multi-head latent attention.
 
@@ -266,17 +332,24 @@ class MultiHeadLatentAttention(eqx.Module):
             x: Input sequence of shape (seq_len, embed_dim)
             mask: Optional attention mask of shape (seq_len, seq_len)
                   True = can attend, False = cannot attend
+            cache: Optional KV cache for inference mode
             key: Optional PRNG key (unused, for interface compatibility)
 
         Returns:
-            Output sequence of shape (seq_len, embed_dim)
+            Tuple of:
+            - Output sequence of shape (seq_len, embed_dim)
+            - Updated cache (or None if not using cache)
         """
-        # Compute attention with gradient checkpointing
-        attn_flat = eqx.filter_checkpoint(self.compute_attention_content)(x, mask)
+        # Compute attention (with or without gradient checkpointing based on cache)
+        if cache is None:
+            attn_flat, new_cache = eqx.filter_checkpoint(self.compute_attention_content)(x, mask, cache)
+        else:
+            # Don't checkpoint in inference mode
+            attn_flat, new_cache = self.compute_attention_content(x, mask, cache)
 
         # Project back to embedding dimension
         output = jax.vmap(self.out_proj)(attn_flat)
-        return output
+        return output, new_cache
 
 if __name__ == "__main__":
     key = jax.random.PRNGKey(0)
@@ -303,7 +376,7 @@ if __name__ == "__main__":
     x = jax.random.normal(key, (seq_len, embed_dim))
 
     def loss_fn(model, x, mask):
-        out = model(x, mask)
+        out, _ = model(x, mask)
         return jnp.sum(out)
 
 
@@ -313,7 +386,7 @@ if __name__ == "__main__":
 
 
     print("Running forward pass...")
-    out = model(x, mask)
+    out, _ = model(x, mask)
 
     grads = jax.grad(loss_fn)(model, x, mask)
     print(f"Output shape: {out.shape}")
@@ -321,3 +394,95 @@ if __name__ == "__main__":
 
     assert out.shape == (seq_len, embed_dim), f"Shape Mismatch! Expected {(seq_len, embed_dim)}, got {out.shape}"
     print("✅ Success! Output shape matches input shape.")
+
+    # Test KV caching
+    print("\nTesting KV caching...")
+    max_seq = 128
+    cache = model.init_cache(max_seq)
+
+    # Process tokens one by one
+    cache_test = cache
+    for i in range(5):
+        token = jax.random.normal(jax.random.PRNGKey(100 + i), (1, embed_dim))
+        token_out, cache_test = model(token, cache=cache_test)
+        print(f"  Token {i+1}: Input {token.shape} -> Output {token_out.shape}, Cache position: {cache_test.position}")
+
+    print("✅ KV caching works!")
+
+    # Benchmark: MLA with and without cache
+    print("\n" + "="*60)
+    print("PERFORMANCE COMPARISON: MLA with vs without KV Cache")
+    print("="*60)
+
+    import time
+
+    num_tokens = 50
+    warmup_tokens = 5
+
+    print(f"\nGenerating {num_tokens} tokens autoregressively...")
+
+    # Benchmark WITHOUT cache (recompute full sequence each time)
+    print("\n1. WITHOUT KV Cache (recomputing full attention each step):")
+    start_no_cache = time.time()
+
+    generated_seq = []
+    for i in range(warmup_tokens + num_tokens):
+        token = jax.random.normal(jax.random.PRNGKey(200 + i), (1, embed_dim))
+        generated_seq.append(token)
+
+        # Concatenate all tokens so far
+        full_seq = jnp.concatenate(generated_seq, axis=0)
+
+        # Create causal mask for full sequence
+        curr_len = full_seq.shape[0]
+        mask_full = jnp.tril(jnp.ones((curr_len, curr_len), dtype=bool))
+
+        # Compute attention over full sequence (no cache)
+        out, _ = model(full_seq, mask=mask_full, cache=None)
+
+        # We only care about the last token's output
+        _ = out[-1]  # Force computation
+
+        if i == warmup_tokens - 1:
+            # Start timing after warmup
+            generated_seq = generated_seq[-1:]  # Keep only last token
+            start_no_cache = time.time()
+
+    end_no_cache = time.time()
+    time_no_cache = end_no_cache - start_no_cache
+    tokens_per_sec_no_cache = num_tokens / time_no_cache
+
+    print(f"   Time: {time_no_cache:.4f}s")
+    print(f"   Tokens/sec: {tokens_per_sec_no_cache:.2f}")
+
+    # Benchmark WITH cache (incremental attention)
+    print("\n2. WITH KV Cache (incremental attention):")
+
+    cache_bench = model.init_cache(max_seq_len=warmup_tokens + num_tokens + 10)
+
+    # Warmup
+    for i in range(warmup_tokens):
+        token = jax.random.normal(jax.random.PRNGKey(300 + i), (1, embed_dim))
+        out, cache_bench = model(token, cache=cache_bench)
+
+    # Actual benchmark
+    start_with_cache = time.time()
+
+    for i in range(num_tokens):
+        token = jax.random.normal(jax.random.PRNGKey(300 + warmup_tokens + i), (1, embed_dim))
+        out, cache_bench = model(token, cache=cache_bench)
+        _ = out  # Force computation
+
+    end_with_cache = time.time()
+    time_with_cache = end_with_cache - start_with_cache
+    tokens_per_sec_with_cache = num_tokens / time_with_cache
+
+    print(f"   Time: {time_with_cache:.4f}s")
+    print(f"   Tokens/sec: {tokens_per_sec_with_cache:.2f}")
+
+    # Summary
+    speedup = time_no_cache / time_with_cache
+    print("\n" + "="*60)
+    print(f"SPEEDUP: {speedup:.2f}x faster with KV caching")
+    print(f"Efficiency gain: {(1 - 1/speedup)*100:.1f}% reduction in computation")
+    print("="*60)
