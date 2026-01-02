@@ -19,7 +19,7 @@ import equinox as eqx
 from jaxtyping import Float, Int, Bool, PRNGKeyArray, Array
 from typing import Optional, Tuple, NamedTuple
 
-BACKEND = "xla"
+BACKEND = "cudnn"
 
 def _make_rotary_PE(max_len: int, dim: int)-> Tuple[Float[Array, "seq dim_half"], Float[Array, "seq dim_half"]]:
     """
