@@ -59,6 +59,8 @@
           jax
           jaxlib
           jaxtyping
+	  beartype
+
           equinox
           wadler-lindig
 
@@ -79,6 +81,8 @@
           click
 	  tqdm
 	  streamlit
+
+
 
         ];
 
