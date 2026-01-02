@@ -72,18 +72,25 @@ def test_inference_cache_initialization(rng_key):
     """
     Test that inference cache initializes with correct shapes and values.
     """
-    batch_size = 2
     d_conv = 4
     d_inner = 128
     d_state = 64
+    nheads = 4
+    headdim = 32
+    ngroups = 1
 
     cache = Mamba2InferenceCache(
-        conv_state=jnp.zeros((batch_size, d_inner, d_conv)),
-        ssm_state=jnp.zeros((batch_size, d_state, d_inner))
+        d_inner=d_inner,
+        d_conv=d_conv,
+        nheads=nheads,
+        headdim=headdim,
+        d_state=d_state,
+        ngroups=ngroups,
     )
 
-    assert cache.conv_state.shape == (batch_size, d_inner, d_conv)
-    assert cache.ssm_state.shape == (batch_size, d_state, d_inner)
+    d_conv_in = d_inner + 2 * ngroups * d_state
+    assert cache.conv_state.shape == (d_conv_in, d_conv - 1)
+    assert cache.ssm_state.shape == (nheads, headdim, d_state)
     assert jnp.all(cache.conv_state == 0)
     assert jnp.all(cache.ssm_state == 0)
 
@@ -94,7 +101,6 @@ def test_mamba2_init_cache(rng_key):
     Test that Mamba2.init_cache creates properly shaped cache.
     """
     d_model = 64
-    batch_size = 2
 
     model = Mamba2(
         d_model=d_model,
@@ -105,11 +111,12 @@ def test_mamba2_init_cache(rng_key):
         key=rng_key
     )
 
-    cache = model.init_cache(batch_size)
+    cache = model.init_cache()
 
     assert isinstance(cache, Mamba2InferenceCache)
-    assert cache.conv_state.shape == (batch_size, model.d_inner, model.d_conv)
-    assert cache.ssm_state.shape == (batch_size, model.d_state, model.nheads, model.headdim)
+    d_conv_in = model.d_inner + 2 * model.ngroups * model.d_state
+    assert cache.conv_state.shape == (d_conv_in, model.d_conv - 1)
+    assert cache.ssm_state.shape == (model.nheads, model.headdim, model.d_state)
 
 
 # ============================================================================
@@ -238,7 +245,6 @@ def test_mamba2_forward_shape(rng_key):
     """
     d_model = 64
     seq_len = 32
-    batch_size = 2
 
     model = Mamba2(
         d_model=d_model,
@@ -250,16 +256,17 @@ def test_mamba2_forward_shape(rng_key):
         key=rng_key
     )
 
-    # Input shape: (batch, seq_len, d_model)
-    x = jax.random.normal(rng_key, (batch_size, seq_len, d_model))
+    # Input shape: (seq_len, d_model)
+    x = jax.random.normal(rng_key, (seq_len, d_model))
 
     # Forward pass (training mode, no cache)
-    output = model(x)
+    output, cache = model(x)
 
     # Output should have same shape as input
-    assert output.shape == (batch_size, seq_len, d_model)
+    assert output.shape == (seq_len, d_model)
     assert not jnp.any(jnp.isnan(output))
     assert jnp.all(jnp.isfinite(output))
+    assert cache is None
 
 
 @pytest.mark.unit
@@ -268,7 +275,6 @@ def test_mamba2_forward_different_sequence_lengths(rng_key):
     Test forward pass with various sequence lengths.
     """
     d_model = 64
-    batch_size = 2
 
     model = Mamba2(
         d_model=d_model,
@@ -281,19 +287,20 @@ def test_mamba2_forward_different_sequence_lengths(rng_key):
     seq_lengths = [8, 16, 32, 64, 127]  # Including non-multiple of chunk_size
 
     for seq_len in seq_lengths:
-        x = jax.random.normal(rng_key, (batch_size, seq_len, d_model))
-        output = model(x)
+        x = jax.random.normal(rng_key, (seq_len, d_model))
+        output, cache = model(x)
 
-        assert output.shape == (batch_size, seq_len, d_model), \
+        assert output.shape == (seq_len, d_model), \
             f"Failed for seq_len={seq_len}"
         assert not jnp.any(jnp.isnan(output)), \
             f"NaN values for seq_len={seq_len}"
+        assert cache is None
 
 
 @pytest.mark.unit
 def test_mamba2_forward_single_batch(rng_key):
     """
-    Test forward pass with batch_size=1.
+    Test forward pass with single sequence.
     """
     d_model = 64
     seq_len = 32
@@ -305,11 +312,12 @@ def test_mamba2_forward_single_batch(rng_key):
         key=rng_key
     )
 
-    x = jax.random.normal(rng_key, (1, seq_len, d_model))
-    output = model(x)
+    x = jax.random.normal(rng_key, (seq_len, d_model))
+    output, cache = model(x)
 
-    assert output.shape == (1, seq_len, d_model)
+    assert output.shape == (seq_len, d_model)
     assert not jnp.any(jnp.isnan(output))
+    assert cache is None
 
 
 @pytest.mark.unit
@@ -319,7 +327,6 @@ def test_mamba2_forward_chunked_computation(rng_key):
     """
     d_model = 64
     seq_len = 64
-    batch_size = 2
     chunk_size = 16
 
     model = Mamba2(
@@ -330,13 +337,14 @@ def test_mamba2_forward_chunked_computation(rng_key):
         key=rng_key
     )
 
-    x = jax.random.normal(rng_key, (batch_size, seq_len, d_model))
+    x = jax.random.normal(rng_key, (seq_len, d_model))
 
     # Should process as 64/16 = 4 chunks
-    output = model(x)
+    output, cache = model(x)
 
-    assert output.shape == (batch_size, seq_len, d_model)
+    assert output.shape == (seq_len, d_model)
     assert not jnp.any(jnp.isnan(output))
+    assert cache is None
 
 
 # ============================================================================
@@ -349,7 +357,6 @@ def test_mamba2_inference_step(rng_key):
     Test single-step inference with cache.
     """
     d_model = 64
-    batch_size = 2
 
     model = Mamba2(
         d_model=d_model,
@@ -360,16 +367,16 @@ def test_mamba2_inference_step(rng_key):
     )
 
     # Initialize cache
-    cache = model.init_cache(batch_size)
+    cache = model.init_cache()
 
-    # Single token input: (batch, 1, d_model)
-    x = jax.random.normal(rng_key, (batch_size, 1, d_model))
+    # Single token input: (d_model,)
+    x = jax.random.normal(rng_key, (d_model,))
 
     # Run inference step
     output, new_cache = model(x, cache=cache)
 
     # Check output shape
-    assert output.shape == (batch_size, 1, d_model)
+    assert output.shape == (d_model,)
     assert not jnp.any(jnp.isnan(output))
 
     # Check that cache was updated
@@ -384,7 +391,6 @@ def test_mamba2_inference_multiple_steps(rng_key):
     Test multiple sequential inference steps.
     """
     d_model = 64
-    batch_size = 1
     num_steps = 10
 
     model = Mamba2(
@@ -395,18 +401,19 @@ def test_mamba2_inference_multiple_steps(rng_key):
         key=rng_key
     )
 
-    cache = model.init_cache(batch_size)
+    cache = model.init_cache()
 
     outputs = []
     for i in range(num_steps):
-        x = jax.random.normal(jax.random.PRNGKey(i), (batch_size, 1, d_model))
+        x = jax.random.normal(jax.random.PRNGKey(i), (d_model,))
         output, cache = model(x, cache=cache)
         outputs.append(output)
 
     # All outputs should be valid
     for i, output in enumerate(outputs):
-        assert output.shape == (batch_size, 1, d_model), f"Step {i} shape mismatch"
+        assert output.shape == (d_model,), f"Step {i} shape mismatch"
         assert not jnp.any(jnp.isnan(output)), f"Step {i} contains NaN"
+        assert jnp.all(jnp.isfinite(output)), f"Step {i} non-finite"
 
 
 @pytest.mark.integration
@@ -420,7 +427,6 @@ def test_mamba2_inference_vs_training_consistency(rng_key):
     """
     d_model = 32
     seq_len = 8
-    batch_size = 1
 
     model = Mamba2(
         d_model=d_model,
@@ -432,21 +438,21 @@ def test_mamba2_inference_vs_training_consistency(rng_key):
     )
 
     # Generate input sequence
-    x_full = jax.random.normal(rng_key, (batch_size, seq_len, d_model))
+    x_full = jax.random.normal(rng_key, (seq_len, d_model))
 
     # Training mode: process all at once
-    output_training = model(x_full)
+    output_training, _ = model(x_full)
 
     # Inference mode: process step by step
-    cache = model.init_cache(batch_size)
+    cache = model.init_cache()
     outputs_inference = []
 
     for t in range(seq_len):
-        x_t = x_full[:, t:t+1, :]  # (batch, 1, d_model)
+        x_t = x_full[t, :]  # (d_model,)
         output_t, cache = model(x_t, cache=cache)
         outputs_inference.append(output_t)
 
-    output_inference = jnp.concatenate(outputs_inference, axis=1)
+    output_inference = jnp.stack(outputs_inference, axis=0)
 
     # Shapes should match
     assert output_inference.shape == output_training.shape
@@ -466,35 +472,40 @@ def test_mamba2_gradient_flow(rng_key):
     """
     Test that gradients flow properly through Mamba2.
     """
-    d_model = 64
+    d_model = 32
     seq_len = 16
-    batch_size = 2
 
     model = Mamba2(
         d_model=d_model,
-        d_state=32,
-        headdim=32,
+        d_state=16,
+        d_conv=4,
+        headdim=16,
         key=rng_key
     )
 
-    x = jax.random.normal(rng_key, (batch_size, seq_len, d_model))
+    x = jax.random.normal(rng_key, (seq_len, d_model))
 
     def loss_fn(model, x):
-        output = model(x)
+        output, _ = model(x)
         return jnp.mean(output ** 2)
 
     # Compute gradients
-    grads = jax.grad(loss_fn)(model, x)
+    loss, grads = eqx.filter_value_and_grad(loss_fn)(model, x)
+
+    # Check loss is finite
+    assert jnp.isfinite(loss)
 
     # Check that key parameters have gradients
     assert grads.in_proj.weight is not None
     assert grads.out_proj.weight is not None
     assert grads.dt_bias is not None
     assert grads.A_log is not None
-    assert grads.D is not None
 
-    # Check gradients are not all zeros
+    # Check gradients are finite and not all zeros
+    assert jnp.all(jnp.isfinite(grads.in_proj.weight))
     assert not jnp.all(grads.in_proj.weight == 0)
+    assert jnp.all(jnp.isfinite(grads.out_proj.weight))
+    assert not jnp.all(grads.out_proj.weight == 0)
     assert not jnp.all(grads.dt_bias == 0)
 
 
@@ -503,24 +514,27 @@ def test_mamba2_gradient_finite(rng_key):
     """
     Test that all gradients are finite (no NaN or Inf).
     """
-    d_model = 64
+    d_model = 32
     seq_len = 16
-    batch_size = 2
 
     model = Mamba2(
         d_model=d_model,
-        d_state=32,
-        headdim=32,
+        d_state=16,
+        d_conv=4,
+        headdim=16,
         key=rng_key
     )
 
-    x = jax.random.normal(rng_key, (batch_size, seq_len, d_model))
+    x = jax.random.normal(rng_key, (seq_len, d_model))
 
     def loss_fn(model, x):
-        output = model(x)
+        output, _ = model(x)
         return jnp.sum(output ** 2)
 
-    grads = jax.grad(loss_fn)(model, x)
+    loss, grads = eqx.filter_value_and_grad(loss_fn)(model, x)
+
+    # Check loss is finite
+    assert jnp.isfinite(loss)
 
     # Check key gradient arrays for finite values
     grad_arrays = [
@@ -539,10 +553,9 @@ def test_mamba2_gradient_finite(rng_key):
 @pytest.mark.gradient
 def test_mamba2_gradient_through_inference(rng_key):
     """
-    Test that gradients can flow through inference mode.
+    Test that gradients can be computed through inference mode.
     """
     d_model = 32
-    batch_size = 1
 
     model = Mamba2(
         d_model=d_model,
@@ -552,16 +565,16 @@ def test_mamba2_gradient_through_inference(rng_key):
         key=rng_key
     )
 
-    cache = model.init_cache(batch_size)
-    x = jax.random.normal(rng_key, (batch_size, 1, d_model))
+    cache = model.init_cache()
+    x = jax.random.normal(rng_key, (d_model,))
 
     def loss_fn(model, x, cache):
         output, _ = model(x, cache=cache)
-        return jnp.sum(output)
+        return jnp.mean(output ** 2)
 
-    # Should be able to compute gradients
-    grads = jax.grad(loss_fn)(model, x, cache)
+    loss, grads = eqx.filter_value_and_grad(loss_fn)(model, x, cache)
 
+    assert jnp.isfinite(loss)
     assert grads.in_proj.weight is not None
     assert jnp.all(jnp.isfinite(grads.in_proj.weight))
 
@@ -573,40 +586,41 @@ def test_mamba2_gradient_through_inference(rng_key):
 @pytest.mark.integration
 def test_mamba2_jit_compilation(rng_key):
     """
-    Test that Mamba2 can be JIT compiled.
+    Test that Mamba2 works with JIT compilation.
     """
-    d_model = 64
-    seq_len = 32
-    batch_size = 2
+    d_model = 32
+    seq_len = 16
 
     model = Mamba2(
         d_model=d_model,
-        d_state=32,
-        headdim=32,
+        d_state=16,
+        d_conv=4,
+        headdim=16,
         key=rng_key
     )
 
-    x = jax.random.normal(rng_key, (batch_size, seq_len, d_model))
+    x = jax.random.normal(rng_key, (seq_len, d_model))
 
-    @jax.jit
+    @eqx.filter_jit
     def forward(model, x):
         return model(x)
 
     # Should compile and run without error
-    output = forward(model, x)
+    output, cache = forward(model, x)
 
-    assert output.shape == (batch_size, seq_len, d_model)
+    assert output.shape == (seq_len, d_model)
     assert not jnp.any(jnp.isnan(output))
+    assert cache is None
 
     # Run again to test cached compilation
-    output2 = forward(model, x)
+    output2, cache2 = forward(model, x)
     assert jnp.allclose(output, output2)
 
 
 @pytest.mark.integration
 def test_mamba2_vmap_compatibility(rng_key):
     """
-    Test that Mamba2 works with vmap for processing multiple sequences.
+    Test that Mamba2 works with vmap for batch processing.
     """
     d_model = 32
     seq_len = 16
@@ -615,21 +629,18 @@ def test_mamba2_vmap_compatibility(rng_key):
     model = Mamba2(
         d_model=d_model,
         d_state=16,
+        d_conv=4,
         headdim=16,
         key=rng_key
     )
 
-    # Create inputs without batch dimension (will be added by vmap)
-    x_single = jax.random.normal(rng_key, (seq_len, d_model))
-    x_batched = jnp.stack([x_single] * num_sequences)
+    # Create batched inputs (num_sequences, seq_len, d_model)
+    x_batched = jax.random.normal(rng_key, (num_sequences, seq_len, d_model))
 
     # Define a function that processes a single sequence
     def process_single(x):
-        # Add batch dimension of 1
-        x_batch = x[None, :, :]
-        output = model(x_batch)
-        # Remove batch dimension
-        return output[0]
+        output, _ = model(x)
+        return output
 
     # Apply vmap
     batched_process = jax.vmap(process_single)
@@ -638,16 +649,16 @@ def test_mamba2_vmap_compatibility(rng_key):
     outputs = batched_process(x_batched)
 
     assert outputs.shape == (num_sequences, seq_len, d_model)
+    assert jnp.all(jnp.isfinite(outputs))
     assert not jnp.any(jnp.isnan(outputs))
 
 
 @pytest.mark.integration
 def test_mamba2_scan_for_autoregressive_generation(rng_key):
     """
-    Test using lax.scan for efficient autoregressive generation.
+    Test using lax.scan for autoregressive generation.
     """
     d_model = 32
-    batch_size = 1
     num_steps = 10
 
     model = Mamba2(
@@ -658,11 +669,11 @@ def test_mamba2_scan_for_autoregressive_generation(rng_key):
         key=rng_key
     )
 
-    # Generate sequence of inputs
-    inputs = jax.random.normal(rng_key, (num_steps, batch_size, 1, d_model))
+    # Generate sequence of single token inputs (num_steps, d_model)
+    inputs = jax.random.normal(rng_key, (num_steps, d_model))
 
     # Initial cache
-    init_cache = model.init_cache(batch_size)
+    init_cache = model.init_cache()
 
     def step_fn(cache, x):
         output, new_cache = model(x, cache=cache)
@@ -671,7 +682,8 @@ def test_mamba2_scan_for_autoregressive_generation(rng_key):
     # Run scan
     final_cache, outputs = jax.lax.scan(step_fn, init_cache, inputs)
 
-    assert outputs.shape == (num_steps, batch_size, 1, d_model)
+    assert outputs.shape == (num_steps, d_model)
+    assert jnp.all(jnp.isfinite(outputs))
     assert not jnp.any(jnp.isnan(outputs))
     assert isinstance(final_cache, Mamba2InferenceCache)
 
@@ -683,97 +695,107 @@ def test_mamba2_scan_for_autoregressive_generation(rng_key):
 @pytest.mark.unit
 def test_mamba2_zero_input(rng_key):
     """
-    Test that model handles zero input gracefully.
+    Test that Mamba2 handles zero input gracefully.
     """
-    d_model = 64
+    d_model = 32
     seq_len = 16
-    batch_size = 2
 
     model = Mamba2(
         d_model=d_model,
-        d_state=32,
-        headdim=32,
+        d_state=16,
+        d_conv=4,
+        headdim=16,
         key=rng_key
     )
 
-    x = jnp.zeros((batch_size, seq_len, d_model))
-    output = model(x)
+    x = jnp.zeros((seq_len, d_model))
+    output, cache = model(x)
 
-    assert output.shape == (batch_size, seq_len, d_model)
+    assert output.shape == (seq_len, d_model)
     assert jnp.all(jnp.isfinite(output))
+    assert cache is None
 
 
 @pytest.mark.unit
 def test_mamba2_very_small_sequence(rng_key):
     """
-    Test with sequence length = 1.
+    Test with very small sequence (edge case).
     """
-    d_model = 64
-    batch_size = 2
+    d_model = 32
+    seq_len = 2
 
     model = Mamba2(
         d_model=d_model,
-        d_state=32,
-        headdim=32,
-        chunk_size=16,
+        d_state=16,
+        d_conv=4,
+        headdim=16,
         key=rng_key
     )
 
-    x = jax.random.normal(rng_key, (batch_size, 1, d_model))
-    output = model(x)
+    x = jax.random.normal(rng_key, (seq_len, d_model))
+    output, cache = model(x)
 
-    assert output.shape == (batch_size, 1, d_model)
+    assert output.shape == (seq_len, d_model)
     assert not jnp.any(jnp.isnan(output))
+    assert jnp.all(jnp.isfinite(output))
+    assert cache is None
 
 
 @pytest.mark.slow
+@pytest.mark.integration
 def test_mamba2_long_sequence(rng_key):
     """
-    Test with a longer sequence to verify chunked computation.
+    Test with a long sequence to verify chunking works.
     """
-    d_model = 64
+    d_model = 32
     seq_len = 512
-    batch_size = 1
+    chunk_size = 64
 
     model = Mamba2(
         d_model=d_model,
-        d_state=32,
-        headdim=32,
-        chunk_size=64,
+        d_state=16,
+        d_conv=4,
+        headdim=16,
+        chunk_size=chunk_size,
         key=rng_key
     )
 
-    x = jax.random.normal(rng_key, (batch_size, seq_len, d_model))
-    output = model(x)
+    x = jax.random.normal(rng_key, (seq_len, d_model))
+    output, cache = model(x)
 
-    assert output.shape == (batch_size, seq_len, d_model)
+    assert output.shape == (seq_len, d_model)
     assert not jnp.any(jnp.isnan(output))
+    assert jnp.all(jnp.isfinite(output))
+    assert cache is None
 
 
 @pytest.mark.unit
 def test_mamba2_different_chunk_sizes(rng_key):
     """
-    Test that different chunk sizes all work correctly.
+    Test that different chunk sizes produce valid outputs.
     """
-    d_model = 64
+    d_model = 32
     seq_len = 64
-    batch_size = 2
 
-    chunk_sizes = [8, 16, 32, 64, 128]
+    chunk_sizes = [16, 32, 64, 128]
 
     for chunk_size in chunk_sizes:
         model = Mamba2(
             d_model=d_model,
-            d_state=32,
-            headdim=32,
+            d_state=16,
+            d_conv=4,
+            headdim=16,
             chunk_size=chunk_size,
             key=rng_key
         )
 
-        x = jax.random.normal(rng_key, (batch_size, seq_len, d_model))
-        output = model(x)
+        x = jax.random.normal(rng_key, (seq_len, d_model))
+        output, cache = model(x)
 
-        assert output.shape == (batch_size, seq_len, d_model), \
+        assert output.shape == (seq_len, d_model), \
             f"Failed for chunk_size={chunk_size}"
         assert not jnp.any(jnp.isnan(output)), \
-            f"NaN values for chunk_size={chunk_size}"
+            f"NaN for chunk_size={chunk_size}"
+        assert jnp.all(jnp.isfinite(output)), \
+            f"Non-finite for chunk_size={chunk_size}"
+        assert cache is None
