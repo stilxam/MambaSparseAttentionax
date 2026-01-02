@@ -1,12 +1,11 @@
-from src.mambax import Mamba2, Mamba2InferenceCache
-from src.mhlax import MultiHeadLatentAttention, MLAKVCache, _make_rotary_PE, _apply_rotary_PE
-
-
 import jax
 import jax.numpy as jnp
 import equinox as eqx
 from jaxtyping import Float, Array, PRNGKeyArray, Bool, Int
 from typing import Optional, Tuple, NamedTuple
+
+from .mambax import Mamba2, Mamba2InferenceCache
+from .mhlax import MultiHeadLatentAttention, MLAKVCache, _make_rotary_PE, _apply_rotary_PE
 
 class MambaIndexer(eqx.Module):
     """
@@ -294,7 +293,7 @@ if __name__ == "__main__":
     warmup_tokens = 5
 
     # Create a simpler model for MLA-only testing
-    from src.mhlax import MultiHeadLatentAttention
+    from .mhlax import MultiHeadLatentAttention
 
     key_mla_test = jax.random.PRNGKey(999)
     mla_test = MultiHeadLatentAttention(

@@ -19,6 +19,7 @@ import equinox as eqx
 from jaxtyping import Float, Int, Bool, PRNGKeyArray, Array
 from typing import Optional, Tuple, NamedTuple
 
+BACKEND = "xla"
 
 def _make_rotary_PE(seq_len: int, dim: int,)-> Tuple[Float[Array, "seq dim_half"], Float[Array, "seq dim_half"]]:
     """
@@ -310,7 +311,7 @@ class MultiHeadLatentAttention(eqx.Module):
             key=k_attn,
             value=v_attn,
             mask=mask_4d,
-            implementation="cudnn"
+            implementation=BACKEND
         )
 
         # Remove padding from output (keep only first v_head_dim dimensions)
