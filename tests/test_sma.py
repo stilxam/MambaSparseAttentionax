@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import equinox as eqx
 
 from src.sma import SparseMambaAttax, MambaIndexer, SparseMambaInferenceCache
+from src.mhlax import _make_rotary_PE
 
 
 class TestMambaIndexer:
@@ -450,10 +451,14 @@ class TestSparseMambaInferenceCache:
             d_state=64,
             ngroups=1
         )
+        # Create sin/cos for RoPE (assuming rope_dim = 0 for this test, minimal size)
+        sin, cos = _make_rotary_PE(256, 16)
         mock_mla_cache = MLAKVCache(
             keys=jnp.zeros((256, 4, 32)),
             values=jnp.zeros((256, 4, 32)),
-            position=0
+            position=0,
+            sin=sin,
+            cos=cos
         )
 
         cache = SparseMambaInferenceCache(

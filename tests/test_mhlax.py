@@ -26,6 +26,23 @@ from src.mhlax import (
 
 
 # ============================================================================
+# Helper Functions
+# ============================================================================
+
+def create_mla_kv_cache(max_seq_len, num_heads, key_dim, value_dim, rope_dim=None):
+    """Helper function to create MLAKVCache with proper sin/cos tensors."""
+    if rope_dim is None:
+        # Assume rope_dim is the difference between key_dim and value_dim
+        rope_dim = key_dim - value_dim
+
+    keys = jnp.zeros((max_seq_len, num_heads, key_dim))
+    values = jnp.zeros((max_seq_len, num_heads, value_dim))
+    sin, cos = _make_rotary_PE(max_seq_len, rope_dim)
+
+    return MLAKVCache(keys=keys, values=values, position=0, sin=sin, cos=cos)
+
+
+# ============================================================================
 # Rotary Position Embedding Tests
 # ============================================================================
 
@@ -154,21 +171,21 @@ def test_apply_rotary_pe_invertibility():
 @pytest.mark.unit
 def test_mla_kv_cache_initialization():
     """
-    Test MLAKVCache initialization with correct shapes.
+    Test that cache can be initialized with correct shapes.
     """
     max_seq_len = 64
     num_heads = 4
     key_dim = 80
     value_dim = 64
+    rope_dim = 16
 
-    keys = jnp.zeros((max_seq_len, num_heads, key_dim))
-    values = jnp.zeros((max_seq_len, num_heads, value_dim))
-
-    cache = MLAKVCache(keys=keys, values=values, position=0)
+    cache = create_mla_kv_cache(max_seq_len, num_heads, key_dim, value_dim, rope_dim)
 
     assert cache.keys.shape == (max_seq_len, num_heads, key_dim)
     assert cache.values.shape == (max_seq_len, num_heads, value_dim)
     assert cache.position == 0
+    assert cache.sin.shape == (max_seq_len, rope_dim // 2)
+    assert cache.cos.shape == (max_seq_len, rope_dim // 2)
 
 
 @pytest.mark.unit
@@ -180,12 +197,14 @@ def test_mla_kv_cache_with_data():
     num_heads = 2
     key_dim = 48
     value_dim = 32
+    rope_dim = 16
 
     keys = jax.random.normal(jax.random.PRNGKey(0), (max_seq_len, num_heads, key_dim))
     values = jax.random.normal(jax.random.PRNGKey(1), (max_seq_len, num_heads, value_dim))
+    sin, cos = _make_rotary_PE(max_seq_len, rope_dim)
     position = 10
 
-    cache = MLAKVCache(keys=keys, values=values, position=position)
+    cache = MLAKVCache(keys=keys, values=values, position=position, sin=sin, cos=cos)
 
     # Retrieve data up to position
     active_keys = cache.keys[:position]

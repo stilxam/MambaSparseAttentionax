@@ -316,8 +316,13 @@ class MultiHeadLatentAttention(eqx.Module):
 
             # Combine with user-provided mask if present
             if mask is not None:
-                # User mask is (seq_len, seq_len), pad it to (seq_len, max_len)
-                mask_padded = jnp.pad(mask, [(0, 0), (0, max_len - seq_len)], constant_values=False)
+                # User mask may be (seq_len, seq_len) or (seq_len, total_cached)
+                # Pad it to (seq_len, max_len) if needed
+                current_kv_len = mask.shape[1]
+                if current_kv_len < max_len:
+                    mask_padded = jnp.pad(mask, [(0, 0), (0, max_len - current_kv_len)], constant_values=False)
+                else:
+                    mask_padded = mask
                 mask = cache_mask & mask_padded
             else:
                 mask = cache_mask
@@ -350,12 +355,32 @@ class MultiHeadLatentAttention(eqx.Module):
         v_attn = v_padded.astype(dtype_attn)
 
         # JAX's dot_product_attention expects (Seq, Heads, Dim) for unbatched input
-        attn_out_padded = jax.nn.dot_product_attention(
-            query=q_attn,
-            key=k_attn,
-            value=v_attn,
-            mask=mask_4d,
-            implementation=BACKEND
+        # CUDNN has limitations with certain sequence length combinations (e.g., Q=1, KV=16)
+        # Use lax.cond for JIT-compatible backend selection
+        q_seq_len = q_attn.shape[0]
+        kv_seq_len = k_attn.shape[0]
+
+        # Use default backend if query sequence is very short compared to key/value
+        # or if either dimension is very small (CUDNN flash attention constraints)
+        use_default_backend = (q_seq_len < 4) & (kv_seq_len > 8) | (q_seq_len < 2) | (kv_seq_len < 2)
+
+        def attention_default(args):
+            q, k, v, m = args
+            return jax.nn.dot_product_attention(
+                query=q, key=k, value=v, mask=m, implementation=None
+            )
+
+        def attention_cudnn(args):
+            q, k, v, m = args
+            return jax.nn.dot_product_attention(
+                query=q, key=k, value=v, mask=m, implementation=BACKEND
+            )
+
+        attn_out_padded = jax.lax.cond(
+            use_default_backend,
+            attention_default,
+            attention_cudnn,
+            (q_attn, k_attn, v_attn, mask_4d)
         )
 
         # Remove padding from output (keep only first v_head_dim dimensions)
