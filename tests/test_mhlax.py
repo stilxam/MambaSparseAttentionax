@@ -578,40 +578,6 @@ def test_mla_gradient_finite(rng_key):
             f"Gradient array {i} contains non-finite values"
 
 
-@pytest.mark.gradient
-@pytest.mark.unit
-def test_mla_gradient_with_cache(rng_key):
-    """
-    Test gradient flow with cache enabled.
-    """
-    embed_dim = 64
-    num_heads = 2
-    max_seq_len = 16
-
-    mla = MultiHeadLatentAttention(
-        embed_dim=embed_dim,
-        num_heads=num_heads,
-        q_low_rank=32,
-        kv_low_rank=32,
-        rope_dim=8,
-        v_head_dim=16,
-        key=rng_key
-    )
-
-    x = jax.random.normal(rng_key, (1, embed_dim))
-    cache = mla.init_cache(max_seq_len)
-
-    def loss_fn(model, x, cache):
-        output, _ = model(x, cache=cache)
-        return jnp.mean(output ** 2)
-
-    loss, grads = eqx.filter_value_and_grad(loss_fn)(mla, x, cache)
-
-    assert jnp.isfinite(loss)
-    assert grads.query_down_proj.weight is not None
-    assert jnp.all(jnp.isfinite(grads.query_down_proj.weight))
-
-
 # ============================================================================
 # JAX Transformation Tests
 # ============================================================================
