@@ -501,7 +501,7 @@ class Mamba2(eqx.Module):
         C = broadcast_groups(C)
 
         # SSM Parameters
-        A = -jnp.exp(self.A_log)  # (nheads)
+        A = -jnp.exp(self.A_log)  # (nheads) - negate to get negative A for SSM stability
 
         if durations is not None:
             dt_input = durations[:, None]
@@ -517,8 +517,18 @@ class Mamba2(eqx.Module):
         # materializing (Seq, Head, HeadDim, StateDim) tensor all at once.
         # Use jax.lax.scan to loop over chunks, carrying state H_prev across chunks.
 
-        assert seq_len % self.chunk_size == 0, f"Seq len must be divisible by chunk_size ({self.chunk_size})"
-        num_chunks = seq_len // self.chunk_size
+        # Pad sequence to be divisible by chunk_size
+        pad_len = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
+        if pad_len > 0:
+            # Pad all tensors - pad only the sequence dimension (first axis)
+            dA = jnp.pad(dA, [(0, pad_len), (0, 0)], mode='edge')
+            dt = jnp.pad(dt, [(0, pad_len), (0, 0)], mode='edge')
+            B = jnp.pad(B, [(0, pad_len), (0, 0), (0, 0)], mode='edge')
+            x = jnp.pad(x, [(0, pad_len), (0, 0), (0, 0)], mode='edge')
+            C = jnp.pad(C, [(0, pad_len), (0, 0), (0, 0)], mode='edge')
+
+        padded_len = seq_len + pad_len
+        num_chunks = padded_len // self.chunk_size
 
         # Reshape inputs into chunks: (NumChunks, ChunkSize, ...)
         def to_chunks(t):
@@ -582,11 +592,16 @@ class Mamba2(eqx.Module):
             (chunk_dA, chunk_dt, chunk_B, chunk_x, chunk_C)
         )
 
-        # Reshape chunks back to full sequence
-        y = y_chunks.reshape(seq_len, self.nheads, self.headdim)
+        # Reshape chunks back to full sequence and remove padding
+        y = y_chunks.reshape(padded_len, self.nheads, self.headdim)
+        if pad_len > 0:
+            y = y[:seq_len]  # Remove padding
+            x_unpadded = x[:seq_len]  # Also unpad x for skip connection
+        else:
+            x_unpadded = x
 
         # Skip connection and output projection
-        y = y + (self.D[None, :, None] * x)  # Add skip connection
+        y = y + (self.D[None, :, None] * x_unpadded)  # Add skip connection
         y = y.reshape(seq_len, self.d_inner)
 
         # Normalize, gate with z, and project to output

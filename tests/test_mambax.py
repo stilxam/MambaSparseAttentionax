@@ -34,11 +34,11 @@ def test_segsum_binary_op():
     g1, v1 = jnp.array(0.5), jnp.array(2.0)
     g2, v2 = jnp.array(0.3), jnp.array(3.0)
 
-    # Apply binary op: (g1*g2, g1*v2 + v1)
+    # Apply binary op: (g2*g1, g2*v1 + v2)
     result_g, result_v = segsum_binary_op((g1, v1), (g2, v2))
 
-    expected_g = g1 * g2
-    expected_v = g1 * v2 + v1
+    expected_g = g2 * g1
+    expected_v = g2 * v1 + v2
 
     assert jnp.allclose(result_g, expected_g), f"Gate mismatch: {result_g} vs {expected_g}"
     assert jnp.allclose(result_v, expected_v), f"Value mismatch: {result_v} vs {expected_v}"
@@ -226,9 +226,11 @@ def test_mamba2_parameter_initialization_ranges(rng_key):
         key=rng_key
     )
 
-    # A_log should be negative (A values between 1 and 16 means log(A) between 0 and log(16))
-    # Actually A is initialized in range, then negated, then logged
-    assert jnp.all(model.A_log < 0), "A_log should be negative"
+    # A_log stores positive log(A) where A is in [1, 16]
+    # So log(A) should be in [0, log(16)] ≈ [0, 2.77]
+    # Negation happens during forward pass: A = -exp(A_log)
+    assert jnp.all(model.A_log >= 0), "A_log should be positive (stores log of positive A)"
+    assert jnp.all(model.A_log <= jnp.log(16)), "A_log should be <= log(16)"
 
     # D should be initialized to 1.0
     assert jnp.allclose(model.D, 1.0), "D should be initialized to 1.0"

@@ -21,7 +21,7 @@ from typing import Optional, Tuple, NamedTuple
 
 BACKEND = "xla"
 
-def _make_rotary_PE(seq_len: int, dim: int,)-> Tuple[Float[Array, "seq dim_half"], Float[Array, "seq dim_half"]]:
+def _make_rotary_PE(max_len: int, dim: int)-> Tuple[Float[Array, "seq dim_half"], Float[Array, "seq dim_half"]]:
     """
     Generate sin and cos arrays for Rotary Position Embeddings (RoPE).
 
@@ -29,15 +29,15 @@ def _make_rotary_PE(seq_len: int, dim: int,)-> Tuple[Float[Array, "seq dim_half"
     freq_i = 1 / (10000^(2i/dim)) for i in [0, dim/2)
 
     Args:
-        seq_len: Length of the sequence
+        max_len: Maximum sequence length to pre-compute
         dim: Dimension of the embeddings (must be even)
 
     Returns:
-        Tuple of (sin, cos) arrays, each of shape (seq_len, dim//2)
+        Tuple of (sin, cos) arrays, each of shape (max_len, dim//2)
     """
     inv_freq = 1.0 / jnp.power(10_000, (jnp.arange(0, dim, 2)/dim))
 
-    t = jnp.arange(seq_len)
+    t = jnp.arange(max_len)
     freqs = jnp.outer(t, inv_freq)
     return jnp.sin(freqs), jnp.cos(freqs)
 
@@ -91,10 +91,14 @@ class MLAKVCache(NamedTuple):
               where key_dim = v_head_dim + rope_dim
         values: Cached values of shape (cached_seq, num_heads, v_head_dim)
         position: Current position in the sequence (number of cached tokens)
+        sin: Pre-computed sin for RoPE of shape (max_seq, rope_dim//2)
+        cos: Pre-computed cos for RoPE of shape (max_seq, rope_dim//2)
     """
     keys: Float[Array, "cached_seq num_heads key_dim"]
     values: Float[Array, "cached_seq num_heads v_head_dim"]
     position: int
+    sin: Float[Array, "max_seq rope_half"]
+    cos: Float[Array, "max_seq rope_half"]
 
 
 class MultiHeadLatentAttention(eqx.Module):
@@ -192,15 +196,19 @@ class MultiHeadLatentAttention(eqx.Module):
         Initialize KV cache for inference mode.
 
         Args:
-            max_seq_len: Maximum sequence length to support
+            max_seq_len: Maximum sequence length to cache
 
         Returns:
-            MLAKVCache with zero-initialized keys and values
+            Initialized MLAKVCache with empty buffers and pre-computed RoPE
         """
         key_dim = self.v_head_dim + self.rope_dim
         keys = jnp.zeros((max_seq_len, self.num_heads, key_dim), dtype=jnp.bfloat16)
         values = jnp.zeros((max_seq_len, self.num_heads, self.v_head_dim), dtype=jnp.bfloat16)
-        return MLAKVCache(keys=keys, values=values, position=0)
+
+        # Pre-compute RoPE for all positions
+        sin, cos = _make_rotary_PE(max_seq_len, self.rope_dim)
+
+        return MLAKVCache(keys=keys, values=values, position=0, sin=sin, cos=cos)
 
     def compute_attention_content(
         self,
@@ -256,11 +264,17 @@ class MultiHeadLatentAttention(eqx.Module):
 
         # Shared RoPE key projection (one per position, broadcast to all heads)
         k_rope_shared = jax.vmap(self.k_rope_proj)(x)[:, None, :]  # (seq, 1, rope_dim)
-        sin, cos = _make_rotary_PE(position_offset + seq_len, self.rope_dim)
 
-        # Slice sin/cos to current positions
-        sin = sin[position_offset:position_offset + seq_len]
-        cos = cos[position_offset:position_offset + seq_len]
+        # Get RoPE sin/cos for current positions
+        if cache is not None:
+            # Use pre-computed RoPE from cache - use dynamic_slice for tracing compatibility
+            sin = jax.lax.dynamic_slice(cache.sin, (position_offset, 0), (seq_len, cache.sin.shape[1]))
+            cos = jax.lax.dynamic_slice(cache.cos, (position_offset, 0), (seq_len, cache.cos.shape[1]))
+        else:
+            # Training mode: compute RoPE on the fly
+            sin_full, cos_full = _make_rotary_PE(seq_len, self.rope_dim)
+            sin = sin_full
+            cos = cos_full
 
         # Apply rotary embeddings to position components
         q_rope_rot = _apply_rotary_PE(q_rope, sin, cos)
@@ -274,19 +288,47 @@ class MultiHeadLatentAttention(eqx.Module):
         # Handle KV caching
         new_cache = None
         if cache is not None:
-            # Append new keys and values to cache
-            k_cached = cache.keys.at[position_offset:position_offset + seq_len].set(k_final.astype(jnp.bfloat16))
-            v_cached = cache.values.at[position_offset:position_offset + seq_len].set(v.astype(jnp.bfloat16))
+            # Append new keys and values to cache using dynamic_update_slice for traced values
+            k_to_cache = k_final.astype(jnp.bfloat16)
+            v_to_cache = v.astype(jnp.bfloat16)
+            k_cached = jax.lax.dynamic_update_slice(cache.keys, k_to_cache, (position_offset, 0, 0))
+            v_cached = jax.lax.dynamic_update_slice(cache.values, v_to_cache, (position_offset, 0, 0))
 
-            # Use cached K, V up to current position
-            k_final = k_cached[:position_offset + seq_len]
-            v = v_cached[:position_offset + seq_len]
+            # Use full cached K, V and rely on masking to handle variable length
+            # This avoids dynamic slicing issues with traced values
+            k_final = k_cached
+            v = v_cached
 
-            # Update cache position
+            # Create causal mask that only attends to valid cached positions
+            # Use static arange and dynamic comparisons to support traced position_offset
+            max_len = k_cached.shape[0]
+            query_idx = jnp.arange(seq_len)[:, None]  # relative query positions
+            key_idx = jnp.arange(max_len)[None, :]     # absolute key positions
+
+            # Query absolute positions are position_offset + query_idx
+            query_positions = position_offset + query_idx
+
+            # Can attend if key position < current total position (position_offset + seq_len)
+            valid_mask = key_idx < (position_offset + seq_len)
+            # Also apply causal constraint: can only attend to keys up to current query position
+            causal_mask = key_idx <= query_positions
+            cache_mask = valid_mask & causal_mask
+
+            # Combine with user-provided mask if present
+            if mask is not None:
+                # User mask is (seq_len, seq_len), pad it to (seq_len, max_len)
+                mask_padded = jnp.pad(mask, [(0, 0), (0, max_len - seq_len)], constant_values=False)
+                mask = cache_mask & mask_padded
+            else:
+                mask = cache_mask
+
+            # Update cache position (keep sin/cos from original cache)
             new_cache = MLAKVCache(
                 keys=k_cached,
                 values=v_cached,
-                position=position_offset + seq_len
+                position=position_offset + seq_len,
+                sin=cache.sin,
+                cos=cache.cos
             )
 
         # Pad values with zeros to match key dimension (v_head_dim + rope_dim)
@@ -294,7 +336,9 @@ class MultiHeadLatentAttention(eqx.Module):
         v_padded = jnp.concatenate([v, zeros_padding], axis=-1)
 
         # Prepare mask for attention (expand to 4D for broadcasting)
+        # Combine user-provided mask (if any) with cache mask
         if mask is not None:
+            # mask is from cache or user, shape (seq_len, kv_len) or (seq_len, seq_len)
             mask_4d = mask[None, None, :, :]
         else:
             mask_4d = None
