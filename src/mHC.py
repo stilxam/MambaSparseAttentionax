@@ -40,6 +40,7 @@ class ManifoldConstrainedHyperConnection(eqx.Module):
     alpha_res: Float[Array, ""]
 
     rms_norm: eqx.nn.RMSNorm
+    layer_norm: eqx.nn.RMSNorm
 
     def __init__(
             self,
@@ -69,6 +70,8 @@ class ManifoldConstrainedHyperConnection(eqx.Module):
         self.alpha_res = jnp.array(0.01)
 
         self.rms_norm = eqx.nn.RMSNorm(input_dim)
+        self.layer_norm = eqx.nn.RMSNorm(dim)
+
 
     def __call__(
             self,
@@ -105,6 +108,8 @@ class ManifoldConstrainedHyperConnection(eqx.Module):
         # 5. Pre-Mapping: Aggregate streams to layer input
         # Sum_i (weight_i * stream_i) -> (seq, dim)
         layer_input = jnp.einsum("sn,snd->sd", h_pre_weights, x_stream)
+
+        layer_input = jax.vmap(self.layer_norm)(layer_input)
 
         # 6. Execute Inner Layer (Attention or MLP)
         layer_out_raw = self.layer_f(layer_input, **kwargs)
